@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.thrift.TApplicationException;
 import org.apache.thrift.TBase;
 import org.apache.thrift.TException;
@@ -32,7 +32,9 @@ import org.apache.thrift.TFieldIdEnum;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.protocol.TMessage;
 import org.apache.thrift.protocol.TMessageType;
+import org.apache.thrift.protocol.TMultiplexedProtocol;
 import org.apache.thrift.protocol.TProtocol;
+import org.apache.thrift.protocol.TProtocolDecorator;
 import org.apache.thrift.transport.TFramedTransport;
 import org.apache.thrift.transport.TIOStreamTransport;
 
@@ -45,6 +47,7 @@ import com.alibaba.dubbo.remoting.buffer.ChannelBuffer;
 import com.alibaba.dubbo.remoting.buffer.ChannelBufferInputStream;
 import com.alibaba.dubbo.remoting.exchange.Request;
 import com.alibaba.dubbo.remoting.exchange.Response;
+import com.alibaba.dubbo.rpc.RpcContext;
 import com.alibaba.dubbo.rpc.RpcException;
 import com.alibaba.dubbo.rpc.RpcInvocation;
 import com.alibaba.dubbo.rpc.RpcResult;
@@ -52,14 +55,6 @@ import com.alibaba.dubbo.rpc.protocol.thrift.io.RandomAccessByteArrayOutputStrea
 
 /**
  * Thrift framed protocol codec.
- *
- * <pre>
- * |<-                                  message header                                  ->|<- message body ->|
- * +----------------+----------------------+------------------+---------------------------+------------------+
- * | magic (2 bytes)|message size (4 bytes)|head size(2 bytes)| version (1 byte) | header |   message body   |
- * +----------------+----------------------+------------------+---------------------------+------------------+
- * |<-                                               message size                                          ->|
- * </pre>
  *
  * <p>
  * <b>header fields in version 1</b>
@@ -78,22 +73,11 @@ public class ThriftCodec implements Codec2 {
     private static final ConcurrentMap<String, Class<?>> cachedClass =
             new ConcurrentHashMap<String, Class<?>>();
 
-    static final ConcurrentMap<Long, RequestData> cachedRequest =
-            new ConcurrentHashMap<Long, RequestData>();
-
-    public static final int MESSAGE_LENGTH_INDEX = 2;
-
-    public static final int MESSAGE_HEADER_LENGTH_INDEX = 6;
-
-    public static final int MESSAGE_SHORTEST_LENGTH = 10;
+    public static final int MESSAGE_SHORTEST_LENGTH = 3;
 
     public static final String NAME = "thrift";
 
     public static final String PARAMETER_CLASS_NAME_GENERATOR = "class.name.generator";
-
-    public static final byte VERSION = (byte)1;
-
-    public static final short MAGIC = (short) 0xdabc;
 
     public void encode( Channel channel, ChannelBuffer buffer, Object message )
             throws IOException {
@@ -116,7 +100,6 @@ public class ThriftCodec implements Codec2 {
     }
 
     public Object decode( Channel channel, ChannelBuffer buffer ) throws IOException {
-
         int available = buffer.readableBytes();
 
         if ( available < MESSAGE_SHORTEST_LENGTH ) {
@@ -128,56 +111,68 @@ public class ThriftCodec implements Codec2 {
             TIOStreamTransport transport = new TIOStreamTransport( new ChannelBufferInputStream(buffer));
 
             TBinaryProtocol protocol = new TBinaryProtocol( transport );
+   
+            TMessage message;
+			try {
+				message = protocol.readMessageBegin();
+			} catch (TException e) {
+				throw new IOException( e.getMessage(), e );
+			}
 
-            short magic;
-            int messageLength;
-
-            try{
-//                protocol.readI32(); // skip the first message length
-                byte[] bytes = new byte[4];
-                transport.read( bytes, 0, 4 );
-                magic = protocol.readI16();
-                messageLength = protocol.readI32();
-
-            } catch ( TException e ) {
-                throw new IOException( e.getMessage(), e );
+            // Extract the service name
+            int index = message.name.indexOf(TMultiplexedProtocol.SEPARATOR);
+            if (index < 0) {
+                throw new IOException("Service name not found in message name: " + message.name + ".  Did you " +
+                        "forget to use a TMultiplexProtocol in your client?");
             }
 
-            if ( MAGIC != magic ) {
-                throw new IOException(
-                        new StringBuilder( 32 )
-                                .append( "Unknown magic code " )
-                                .append( magic )
-                                .toString() );
-            }
+            // Create a new TMessage, something that can be consumed by any TProtocol
+            String serviceName = message.name.substring(0, index);
 
-            if ( available < messageLength ) { return  DecodeResult.NEED_MORE_INPUT; }
+            // Create a new TMessage, removing the service name
+            TMessage standardMessage = new TMessage(
+                    message.name.substring(serviceName.length()+TMultiplexedProtocol.SEPARATOR.length()),
+                    message.type,
+                    message.seqid
+            );
 
-            return decode( protocol );
+            return decode( new StoredMessageProtocol(protocol, standardMessage),serviceName);
 
         }
 
     }
-
-    private Object decode( TProtocol protocol )
+    
+    /**
+     *  Our goal was to work with any protocol.  In order to do that, we needed
+     *  to allow them to call readMessageBegin() and get a TMessage in exactly
+     *  the standard format, without the service name prepended to TMessage.name.
+     */
+    private class StoredMessageProtocol extends TProtocolDecorator {
+        TMessage messageBegin;
+        public StoredMessageProtocol(TProtocol protocol, TMessage messageBegin) {
+            super(protocol);
+            this.messageBegin = messageBegin;
+        }
+        @Override
+        public TMessage readMessageBegin() throws TException {
+            return messageBegin;
+        }
+    }
+    
+    private Object decode( TProtocol protocol,String serviceName )
             throws IOException {
-
-        // version
-        String serviceName;
-        long id;
+        long id=-1;
 
         TMessage message;
 
         try {
-            protocol.readI16();
-            protocol.readByte();
-            serviceName = protocol.readString();
-            id = protocol.readI64();
             message = protocol.readMessageBegin();
         } catch ( TException e ) {
+        	e.printStackTrace();
             throw new IOException( e.getMessage(), e );
         }
-
+        id = message.seqid;
+        
         if ( message.type == TMessageType.CALL ) {
 
             RpcInvocation result = new RpcInvocation();
@@ -264,10 +259,7 @@ public class ThriftCodec implements Codec2 {
 
             Request request = new Request( id );
             request.setData( result );
-
-            cachedRequest.putIfAbsent( id,
-                                       RequestData.create( message.seqid, serviceName, message.name ) );
-
+            
             return request;
 
         } else if ( message.type == TMessageType.EXCEPTION ) {
@@ -483,49 +475,17 @@ public class ThriftCodec implements Codec2 {
 
         TBinaryProtocol protocol = new TBinaryProtocol( transport );
 
-        int headerLength, messageLength;
-
-        byte[] bytes = new byte[4];
         try {
-            // magic
-            protocol.writeI16( MAGIC );
-            // message length placeholder
-            protocol.writeI32( Integer.MAX_VALUE );
-            // message header length placeholder
-            protocol.writeI16( Short.MAX_VALUE );
-            // version
-            protocol.writeByte( VERSION );
-            // service name
-            protocol.writeString( serviceName );
-            // dubbo request id
-            protocol.writeI64( request.getId() );
-            protocol.getTransport().flush();
-            // header size
-            headerLength = bos.size();
 
-            // message body
             protocol.writeMessageBegin( message );
             args.write( protocol );
             protocol.writeMessageEnd();
             protocol.getTransport().flush();
-            int oldIndex = messageLength = bos.size();
-
-            // fill in message length and header length
-            try {
-                TFramedTransport.encodeFrameSize( messageLength, bytes );
-                bos.setWriteIndex( MESSAGE_LENGTH_INDEX );
-                protocol.writeI32( messageLength );
-                bos.setWriteIndex( MESSAGE_HEADER_LENGTH_INDEX );
-                protocol.writeI16( ( short )( 0xffff & headerLength ) );
-            } finally {
-                bos.setWriteIndex( oldIndex );
-            }
 
         } catch ( TException e ) {
             throw new RpcException( RpcException.SERIALIZATION_EXCEPTION, e.getMessage(), e );
         }
 
-        buffer.writeBytes(bytes);
         buffer.writeBytes(bos.toByteArray());
 
     }
@@ -535,11 +495,13 @@ public class ThriftCodec implements Codec2 {
 
         RpcResult result = ( RpcResult ) response.getResult();
 
-        RequestData rd = cachedRequest.get( response.getId() );
-
+        //RequestData rd = cachedRequest.get( response.getId() );
+        String serviceName = result.getAttachment(Constants.INTERFACE_KEY);
+        String methodName = result.getAttachment(Constants.METHOD_KEY);
+        
         String resultClassName = ExtensionLoader.getExtensionLoader( ClassNameGenerator.class ).getExtension(
                     channel.getUrl().getParameter(ThriftConstants.CLASS_NAME_GENERATOR_KEY, ThriftClassNameGenerator.NAME))
-                    .generateResultClassName(rd.serviceName, rd.methodName);
+                    .generateResultClassName(serviceName, methodName);
 
         if ( StringUtils.isEmpty( resultClassName ) ) {
             throw new RpcException( RpcException.SERIALIZATION_EXCEPTION,
@@ -628,9 +590,9 @@ public class ThriftCodec implements Codec2 {
         }
 
         if ( applicationException != null ) {
-            message = new TMessage( rd.methodName, TMessageType.EXCEPTION, rd.id );
+            message = new TMessage( methodName, TMessageType.EXCEPTION, (int) response.getId() );
         } else {
-            message = new TMessage( rd.methodName, TMessageType.REPLY, rd.id );
+            message = new TMessage( methodName, TMessageType.REPLY, (int) response.getId());
         }
 
         RandomAccessByteArrayOutputStream bos = new RandomAccessByteArrayOutputStream( 1024 );
@@ -639,27 +601,7 @@ public class ThriftCodec implements Codec2 {
 
         TBinaryProtocol protocol = new TBinaryProtocol( transport );
 
-        int messageLength;
-        int headerLength;
-
-        byte[] bytes = new byte[4];
         try {
-            // magic
-            protocol.writeI16( MAGIC );
-            // message length
-            protocol.writeI32( Integer.MAX_VALUE );
-            // message header length
-            protocol.writeI16( Short.MAX_VALUE );
-            // version
-            protocol.writeByte( VERSION );
-            // service name
-            protocol.writeString( rd.serviceName );
-            // id
-            protocol.writeI64( response.getId() );
-            protocol.getTransport().flush();
-            headerLength = bos.size();
-
-            // message
             protocol.writeMessageBegin( message );
             switch ( message.type ) {
                 case TMessageType.EXCEPTION:
@@ -671,23 +613,10 @@ public class ThriftCodec implements Codec2 {
             }
             protocol.writeMessageEnd();
             protocol.getTransport().flush();
-            int oldIndex = messageLength = bos.size();
-
-            try{
-                TFramedTransport.encodeFrameSize( messageLength, bytes );
-                bos.setWriteIndex( MESSAGE_LENGTH_INDEX );
-                protocol.writeI32( messageLength );
-                bos.setWriteIndex( MESSAGE_HEADER_LENGTH_INDEX );
-                protocol.writeI16( ( short ) ( 0xffff & headerLength ) );
-            } finally {
-                bos.setWriteIndex( oldIndex );
-            }
-
         } catch ( TException e ) {
             throw new RpcException( RpcException.SERIALIZATION_EXCEPTION, e.getMessage(), e );
         }
 
-        buffer.writeBytes(bytes);
         buffer.writeBytes(bos.toByteArray());
 
     }
