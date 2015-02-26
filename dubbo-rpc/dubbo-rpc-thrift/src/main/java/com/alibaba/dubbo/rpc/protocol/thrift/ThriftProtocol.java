@@ -35,6 +35,7 @@ import com.alibaba.dubbo.rpc.Invocation;
 import com.alibaba.dubbo.rpc.Invoker;
 import com.alibaba.dubbo.rpc.RpcContext;
 import com.alibaba.dubbo.rpc.RpcException;
+import com.alibaba.dubbo.rpc.RpcResult;
 import com.alibaba.dubbo.rpc.protocol.AbstractProtocol;
 import com.alibaba.dubbo.rpc.protocol.dubbo.DubboExporter;
 
@@ -77,7 +78,10 @@ public class ThriftProtocol extends AbstractProtocol {
                 }
 
                 RpcContext.getContext().setRemoteAddress(channel.getRemoteAddress());
-                return exporter.getInvoker().invoke( inv );
+                RpcResult result = (RpcResult)exporter.getInvoker().invoke( inv );
+                result.setAttachment(Constants.INTERFACE_KEY, serviceName);
+                result.setAttachment(Constants.METHOD_KEY, inv.getMethodName());
+                return result;
 
             }
 
